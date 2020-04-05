@@ -1361,6 +1361,89 @@ struct iommu_group *fsl_mc_device_group(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(fsl_mc_device_group);
 
+static int pre_def_domain_change(struct device *dev, void *data)
+{
+	struct iommu_group *group = data;
+
+	if (device_is_bound(dev))
+		return -EINVAL;
+
+	return iommu_group_create_direct_mappings(group, dev);
+}
+
+static int post_def_domain_change(struct device *dev, void *data)
+{
+	struct iommu_domain *domain = data;
+
+	return domain->ops->add_device(dev);
+}
+
+/**
+ * Changes the default domain of a group
+ *
+ * @group: The group for which the default domain should be changed
+ * @type: The new default domain type
+ *
+ * The caller should hold the group->mutex before call into this function.
+ * Returns 0 on success and error code on failure.
+ */
+static int iommu_group_change_def_domain(struct iommu_group *group, int type)
+{
+	struct iommu_domain *new, *old;
+	const struct iommu_ops *ops;
+	int ret;
+
+	if ((type != IOMMU_DOMAIN_IDENTITY && type != IOMMU_DOMAIN_DMA) ||
+	    !group->default_domain || type == group->default_domain->type ||
+	    !group->default_domain->ops)
+		return -EINVAL;
+
+	if (group->domain != group->default_domain)
+		return -EBUSY;
+
+	iommu_group_ref_get(group);
+	old = group->default_domain;
+	ops = group->default_domain->ops;
+
+	/* Allocate a new domain of requested type. */
+	new = ops->domain_alloc(type);
+	if (!new) {
+		iommu_group_put(group);
+		return -ENOMEM;
+	}
+	new->type = type;
+	new->ops = ops;
+	new->pgsize_bitmap = old->pgsize_bitmap;
+	group->default_domain = new;
+	group->domain = new;
+
+	ret = __iommu_group_for_each_dev(group, group, pre_def_domain_change);
+	if (ret)
+		goto err_out;
+
+	ret = __iommu_attach_group(new, group);
+	if (ret)
+		goto err_out;
+
+	ret = __iommu_group_for_each_dev(group, new, post_def_domain_change);
+	if (ret)
+		goto err_out;
+
+	iommu_domain_free(old);
+	iommu_group_put(group);
+
+	return 0;
+
+err_out:
+	group->default_domain = old;
+	group->domain = old;
+	__iommu_attach_group(old, group);
+	iommu_domain_free(new);
+	iommu_group_put(group);
+
+	return ret;
+}
+
 /**
  * iommu_group_get_for_dev - Find or create the IOMMU group for a device
  * @dev: target device
@@ -1375,6 +1458,7 @@ struct iommu_group *iommu_group_get_for_dev(struct device *dev)
 {
 	const struct iommu_ops *ops = dev->bus->iommu_ops;
 	struct iommu_group *group;
+	int dev_def_type = 0;
 	int ret;
 
 	group = iommu_group_get(dev);
@@ -1391,20 +1475,24 @@ struct iommu_group *iommu_group_get_for_dev(struct device *dev)
 	if (IS_ERR(group))
 		return group;
 
+	if (ops->def_domain_type)
+		dev_def_type = ops->def_domain_type(dev);
+
 	/*
 	 * Try to allocate a default domain - needs support from the
 	 * IOMMU driver.
 	 */
 	if (!group->default_domain) {
 		struct iommu_domain *dom;
+		int type = dev_def_type ? : iommu_def_domain_type;
 
-		dom = __iommu_domain_alloc(dev->bus, iommu_def_domain_type);
-		if (!dom && iommu_def_domain_type != IOMMU_DOMAIN_DMA) {
+		dom = __iommu_domain_alloc(dev->bus, type);
+		if (!dom && type != IOMMU_DOMAIN_DMA) {
 			dom = __iommu_domain_alloc(dev->bus, IOMMU_DOMAIN_DMA);
 			if (dom) {
 				dev_warn(dev,
 					 "failed to allocate default IOMMU domain of type %u; falling back to IOMMU_DOMAIN_DMA",
-					 iommu_def_domain_type);
+					 type);
 			}
 		}
 
@@ -1417,6 +1505,15 @@ struct iommu_group *iommu_group_get_for_dev(struct device *dev)
 			iommu_domain_set_attr(dom,
 					      DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE,
 					      &attr);
+		}
+	} else if (dev_def_type &&
+		   dev_def_type != group->default_domain->type) {
+		mutex_lock(&group->mutex);
+		ret = iommu_group_change_def_domain(group, dev_def_type);
+		mutex_unlock(&group->mutex);
+		if (ret) {
+			iommu_group_put(group);
+			return ERR_PTR(ret);
 		}
 	}
 
