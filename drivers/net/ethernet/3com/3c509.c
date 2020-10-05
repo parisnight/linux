@@ -1403,7 +1403,7 @@ static int __init el3_init_module(void)
 		if (!request_region(id_port, 1, "3c509-control"))
 			continue;
 		outb(0x00, id_port);
-		outb(0xff, id_port);
+		/* outb(0xff, id_port);*/
 		if (inb(id_port) & 0x01)
 			break;
 		else
